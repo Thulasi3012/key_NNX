@@ -1,24 +1,20 @@
-from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException, Query,Depends
+from fastapi.responses import JSONResponse,StreamingResponse
+from fastapi import FastAPI, HTTPException, Query,Depends,APIRouter,Body
 from pydantic import BaseModel
 from typing import List, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError
 from app.database.models import Transcription, Keyword, Conversation, Project,APIKey
-from app.database.database import TranscriptionSessionLocal
+from app.database.database import TranscriptionSessionLocal,get_db
 import logging
+from rapidfuzz import fuzz
 import re
 import io
 import pandas as pd
-from fastapi.responses import StreamingResponse
-from fastapi import APIRouter, Depends, HTTPException, Body
-from sqlalchemy.orm import Session
 from typing import List
 import uuid
 import json
-from fastapi.responses import JSONResponse
-from app.database.database import get_db
 from app.authentication.authen import generate_api_key, get_api_key, get_api_owner
 from app.authentication.config import settings
 from datetime import datetime
@@ -60,12 +56,26 @@ class APIKeyResponse(BaseModel):
     api_key: str
     owner_name: str
 
+import re
+from fastapi import FastAPI, Query, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from fuzzywuzzy import fuzz
+import logging
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
 
 def clean_text(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9 ]', '', text.casefold()).strip()
 
 
-@app.post("/fetch_keywords_match", summary="Match keywords from JSON based on conversation_id, project_id, builder_name")
+def get_fuzzy_score(keyword, text):
+    partial = fuzz.partial_ratio(keyword, text)
+    token = fuzz.token_set_ratio(keyword, text)
+    return (partial + token) // 2  # average score
+
+@app.post("/fetch_keywords_match", summary="Fuzzy match keywords with intelligent speaker tagging")
 def fetch_keywords_match(
     conversation_id: str = Query(...),
     project_id: int = Query(...),
@@ -74,21 +84,17 @@ def fetch_keywords_match(
     key: str = Depends(get_api_key)
 ):
     try:
-        logger.info(
-            f"Fetching keyword matches for convo={conversation_id}, project={project_id}, builder={builder_name}")
+        logger.info(f"Matching for convo={conversation_id}, project={project_id}, builder={builder_name}")
         owner = get_api_owner(key, session)
 
-        # 1. Validate conversation
-        conversation = session.query(Conversation).filter_by(
-            conversation_id=conversation_id).first()
+        # Validate conversation
+        conversation = session.query(Conversation).filter_by(conversation_id=conversation_id).first()
         if not conversation:
             return JSONResponse(
                 content={"Error code": "ERR-1001",
                          "Error message": "Conversation Id not Match",
                          "Conversation Id": f"{conversation_id}"},
                 status_code=404)
-            # raise HTTPException(
-            # 404, detail=f"Conversation ID:{conversation_id} not found.")
         if conversation.project_id != project_id:
             return JSONResponse(
                 content={"Error code": "ERR-1002",
@@ -96,12 +102,9 @@ def fetch_keywords_match(
                         "Conversation Id": f"{conversation_id}",
                          "Project id": f"{project_id}"},
                status_code=404)
-            # raise HTTPException(
-            #     400, detail=f"Conversation_ID {conversation_id} does not belong to the given project {project_id} and Builder {builder_name} ")
 
-        # 2. Validate builder and project
-        project = session.query(Project).filter_by(
-            id=project_id, builder_name=builder_name.strip()).first()
+        # Validate project
+        project = session.query(Project).filter_by(id=project_id, builder_name=builder_name.strip()).first()
         if not project:
             return JSONResponse(
                 content={"Error code": "ERR-1003",
@@ -110,15 +113,10 @@ def fetch_keywords_match(
                          "Project id": f"{project_id}",
                          "Builder Name": f"{builder_name}"},
                 status_code=404)
-            # raise HTTPException(
-            #     404, detail="Builder and Project ID combination not found.")
 
-        # 3. Get transcription
-        transcription = session.query(Transcription).filter_by(
-            conversation_id=conversation_id).first()
+        # Get transcription
+        transcription = session.query(Transcription).filter_by(conversation_id=conversation_id).first()
         if not transcription or not transcription.transcript_text:
-            # raise HTTPException(
-            #     404, detail="Transcription not found or empty.")
             return JSONResponse(
                 content={"Error code": "ERR-1004",
                          "Error message": "Transcription Not found for this conversation",
@@ -128,14 +126,17 @@ def fetch_keywords_match(
                 status_code=404)
         diarized_segments = transcription.diarized_segments or []
 
-        # 4. Get keywords (new grouped JSON format)
+        # Manually assign roles
+        agent_speaker = "Speaker_1"
+        customer_speaker = "Speaker_0"
+
+        # Fetch keywords
         keyword_obj = session.query(Keyword).filter_by(
             project_id=project_id,
             builder_name=builder_name.strip()
         ).first()
 
         if not keyword_obj or not keyword_obj.keywords:
-            # raise HTTPException(404, detail="No keyword entries found.")
             return JSONResponse(
                 content={"Error code": "ERR-1005",
                          "Error message": "Keyword not found for the given project and builder",
@@ -143,49 +144,38 @@ def fetch_keywords_match(
                          "Builder Name": f"{builder_name}"},
                 status_code=404)
 
-        categorized_keywords = keyword_obj.keywords  # ✅ already in dict format
-
-        agent_speakers = ["Speaker_1"]
-        customer_speakers = ["Speaker_0"]
-
+        categorized_keywords = keyword_obj.keywords
         result = []
 
+        # Fuzzy Match Logic
         for category, keyword_list in categorized_keywords.items():
             keyword_matches = []
 
             for keyword in keyword_list:
-                keyword_clean = clean_text(keyword).replace(" ", "")
-                agent_count = 0
-                customer_count = 0
-                agent_texts = []
-                customer_texts = []
+                keyword_clean = clean_text(keyword)
+                agent_count = customer_count = 0
+                agent_texts, customer_texts = [], []
 
                 for segment in diarized_segments:
-                    speaker = segment.get("speaker", "").casefold()
+                    speaker = segment.get("speaker", "")
                     text = segment.get("text", "")
-                    text_clean = clean_text(text).replace(" ", "")
-                    entry = {"text": text,
-                             "speaker": segment.get("speaker", "")}
+                    text_clean = clean_text(text)
 
-                    if keyword_clean in text_clean:
-                        if speaker in [s.casefold() for s in agent_speakers]:
+                    score = get_fuzzy_score(keyword_clean, text_clean)
+                    if score >= 85:
+                        entry = {"text": text, "speaker": speaker}
+                        if speaker == agent_speaker:
                             agent_count += 1
                             agent_texts.append(entry)
-                        elif speaker in [s.casefold() for s in customer_speakers]:
+                        elif speaker == customer_speaker:
                             customer_count += 1
                             customer_texts.append(entry)
 
                 keyword_matches.append({
                     "keyword": keyword,
                     "countBySpeaker": {
-                        "Agent": {
-                            "count": agent_count,
-                            "text": agent_texts
-                        },
-                        "Customer": {
-                            "count": customer_count,
-                            "text": customer_texts
-                        }
+                        "Agent": {"count": agent_count, "text": agent_texts},
+                        "Customer": {"count": customer_count, "text": customer_texts}
                     }
                 })
 
@@ -195,25 +185,20 @@ def fetch_keywords_match(
             })
 
         return {
+            "status": "success",
             "agent_id": conversation.agent_id,
             "conversation_id": conversation.conversation_id,
             "project_id": project.id,
             "builder_name": project.builder_name,
             "matched_Keywords": result,
-            "diarized_text": diarized_segments
+            "diarized_text": diarized_segments,
+            "agent_speaker": agent_speaker,
+            "customer_speaker": customer_speaker
         }
 
     except Exception as e:
-        logger.exception("❌ Error in /fetch_keywords_match")
-        # return JSONResponse(
-            # content={"Error code": "ERR-1006",
-            #          "Error message": "Keyword Not Match",
-            #          "Conversation Id": f"{conversation_id}",
-            #          "Project id": f"{project_id}",
-            #          "Builder Name": f"{builder_name}"},
-            # status_code=404)
+        logger.exception("Error in fetch_keywords_match")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # Pydantic model for keyword list
 class KeywordItem(BaseModel):
@@ -233,7 +218,7 @@ def replace_keywords(
     key: str = Depends(get_api_key)
 ):
     try:
-        owner = get_api_owner(key, session)  # 🔐 Who's updating
+        owner = get_api_owner(key, session)  #  Who's updating
         builder_name_clean = builder_name.strip()
 
         # ✅ Validate the builder/project combo
@@ -245,7 +230,6 @@ def replace_keywords(
             return JSONResponse(
                 content={"Error code": "ERR-1006",
                          "Error message": "Builder Name and Project_Id Does't not Match",
-                         #  "Conversation Id": f"{conversation_id}",
                          "Project id": f"{project_id}",
                          "Builder Name": f"{builder_name}"},
                 status_code=404)
